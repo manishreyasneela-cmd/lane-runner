@@ -1,0 +1,558 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no,viewport-fit=cover">
+<title>Lane Runner</title>
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#1b1740">
+<link rel="icon" href="icon-192.png">
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#1b1740;touch-action:none;font-family:system-ui,sans-serif;color:#fff;-webkit-user-select:none;user-select:none}
+  canvas{display:block}
+  #menu{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;background:rgba(20,14,48,.88);text-align:center;padding:20px}
+  h1{margin:0;font-size:36px}
+  button{font-size:18px;padding:14px 20px;border-radius:12px;border:0;background:#2ee6c5;color:#102;font-weight:700;min-width:240px}
+  button.alt{background:#ffb347}
+  #result{font-size:20px;color:#ffd23f;min-height:26px}
+  #best{opacity:.8;font-size:14px}
+  .hint{font-size:13px;opacity:.7;max-width:300px}
+  #name{font-size:18px;padding:12px;border-radius:12px;border:0;text-align:center;width:216px}
+  #lb{font-size:14px;max-height:26vh;overflow:auto;min-width:240px;line-height:1.5}
+  #menu{justify-content:flex-start;overflow-y:auto}
+  #menu>:first-child{margin-top:auto}
+  #menu>:last-child{margin-bottom:auto}
+  #home,#roomPanel{display:flex;flex-direction:column;align-items:center;gap:12px}
+  #code{font-size:18px;padding:12px;border-radius:12px;border:0;text-align:center;width:110px;text-transform:uppercase}
+  #roomInfo{font-size:18px;color:#ffd23f}
+  #dburl{font-size:13px;padding:10px;border-radius:10px;border:0;width:230px}
+  #dbsave{min-width:0;font-size:14px;padding:10px 14px}
+  #dbstatus{color:#ffd166;opacity:1}
+  #roomList{font-size:15px;line-height:1.6;max-height:30vh;overflow:auto;min-width:240px}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="menu">
+  <h1>Lane Runner</h1>
+  <div class="hint">Same track for everyone. Compare scores with your friends.</div>
+  <div id="result"></div>
+  <input id="name" maxlength="12" placeholder="Your name">
+
+  <div id="home">
+    <button id="dailyBtn">Daily challenge</button>
+    <button id="freeBtn" class="alt">Free play</button>
+    <button id="raceBtn" class="alt">Create race room</button>
+    <div><input id="code" maxlength="4" placeholder="CODE"> <button id="joinBtn" style="min-width:0">Join room</button></div>
+  </div>
+  <div id="roomPanel" style="display:none">
+    <div id="roomInfo"></div>
+    <div id="roomList"></div>
+    <button id="startBtn">Start race</button>
+    <button id="leaveBtn" class="alt">Leave room</button>
+  </div>
+  <div id="lb"></div>
+  <div id="best"></div>
+  <div id="dbstatus" class="hint"></div>
+  <div id="dbsetup"><input id="dburl" placeholder="Paste Firebase database link"> <button id="dbsave">Save</button></div>
+  <div class="hint">Swipe left or right to change lane. Swipe up to jump over orange barriers. Swipe down to slide under red bars. Grey walls: change lane.</div>
+</div>
+
+<script>
+// Shows any error on the menu screen so we can see what went wrong
+if ('serviceWorker' in navigator) addEventListener('load', function () { navigator.serviceWorker.register('sw.js').catch(function () {}); });
+window.onerror = function (msg, src, line) {
+  var r = document.getElementById('result');
+  if (r) r.textContent = 'Error: ' + msg + ' (line ' + line + ')';
+};
+</script>
+<script>
+// ---------- SETTINGS (safe to change) ----------
+const START_SPEED = 10;   // starting speed
+const MAX_SPEED   = 26;   // top speed
+const SCORE_PER_LEVEL = 500;  // speed goes up every time your score passes another 500
+const SPEED_STEP  = 2;    // how much faster each level is (bigger = harder)
+// Easiest: leave this empty and paste your Firebase link into the box on the menu screen.
+const DB_URL_IN_CODE = 'https://lane-runner-80693-default-rtdb.asia-southeast1.firebasedatabase.app';
+const cleanUrl = u => (u || '').trim().replace(/^['"\u2018\u2019\u201C\u201D]+|['"\u2018\u2019\u201C\u201D]+$/g, '').replace(/\.json$/, '').replace(/\/+$/, '');
+let DB_URL = cleanUrl(DB_URL_IN_CODE);
+try { if (!DB_URL) DB_URL = cleanUrl(localStorage.getItem('db-url')); } catch (e) {}
+const ROW_SPACING = 12;   // distance between obstacle rows (smaller = harder)
+const LANEX = [-1, 0, 1]; // lane positions
+
+// ---------- SEEDED RANDOM: same seed gives the same track for everyone ----------
+function makeRng(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+const dailySeed = () => Math.floor(Date.now() / 86400000);   // changes every day (UTC), same worldwide
+
+// ---------- CANVAS ----------
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+let W, H, HZ, PY, SPREAD, U, CX, TB;
+function resize() {
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  W = innerWidth; H = innerHeight;
+  cv.width = W * dpr; cv.height = H * dpr;
+  cv.style.width = W + 'px'; cv.style.height = H + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  HZ = H * 0.32;                 // horizon line
+  PY = H * 0.82;                 // where the player stands
+  SPREAD = Math.min(W * 0.26, H * 0.17);   // width of one lane
+  U = H * 0.1;                   // size of one world unit
+  CX = W / 2;
+  TB = (H - HZ) / (PY - HZ);     // depth scale at bottom of screen
+}
+addEventListener('resize', resize); resize();
+
+// Perspective helpers: distance d ahead -> scale t, screen y, screen x
+const tOf = d => 1 / (1 + d * 0.055);
+const yOf = t => HZ + (PY - HZ) * t;
+const xOf = (lx, t) => CX + lx * SPREAD * t;
+
+// ---------- GAME STATE ----------
+let state = 'menu';            // menu | play | dead
+let mode = 'daily', seed = 1;
+let distance = 0, speed = START_SPEED, coins = 0;
+let lane = 1, px = 0, py = 0, vy = 0, slideT = 0, deadAt = 0;
+let level = 1, flashT = 0;
+let rowCache = new Map();
+
+function getRow(i) {           // builds one row of obstacles/coins from the seed
+  if (rowCache.has(i)) return rowCache.get(i);
+  const r = makeRng(seed * 100003 + i * 7919);
+  const items = [];
+  const free = Math.floor(r() * 3);          // this lane is always open
+  for (let l = 0; l < 3; l++) {
+    if (l === free) {
+      if (r() < 0.7) for (let c = -1; c <= 1; c++) items.push({ lane: l, z: c * 2.5, bot: 0.6, top: 1.4, type: 'coin' });
+      continue;
+    }
+    if (r() < 0.65) {
+      const t = Math.floor(r() * 3);
+      if (t === 0) items.push({ lane: l, z: 0, bot: 0,   top: 0.8, type: 'low'  });   // jump over
+      if (t === 1) items.push({ lane: l, z: 0, bot: 1.6, top: 2.2, type: 'high' });   // slide under
+      if (t === 2) items.push({ lane: l, z: 0, bot: 0,   top: 2.4, type: 'wall' });   // change lane
+    }
+  }
+  rowCache.set(i, items);
+  return items;
+}
+
+const score = () => Math.floor(distance) + coins * 10;
+const bestKey = () => 'best-' + mode + (mode === 'daily' ? '-' + seed : '');
+function getBest() { try { return +localStorage.getItem(bestKey()) || 0; } catch (e) { return 0; } }
+function setBest(v) { try { localStorage.setItem(bestKey(), v); } catch (e) {} }
+
+function startGame(m, raceSeed) {
+  mode = m;
+  seed = m === 'daily' ? dailySeed() : m === 'race' ? raceSeed : Math.floor(Math.random() * 1e9);
+  rowCache = new Map();
+  distance = 0; coins = 0; speed = START_SPEED;
+  lane = 1; px = 0; py = 0; vy = 0; slideT = 0;
+  level = 1; flashT = 0;
+  state = 'play';
+  document.getElementById('menu').style.display = 'none';
+  if (m === 'race') pushNow(true);
+}
+
+function die() {
+  state = 'dead'; deadAt = performance.now();
+  const s = score(), prev = getBest();
+  if (s > prev) setBest(s);
+  if (mode === 'daily') submitScore(s);
+  if (room && mode === 'race') pushNow(false);
+  document.getElementById('result').textContent = 'Score: ' + s + (s > prev ? '  (new best!)' : '');
+  setTimeout(showMenu, 700);
+}
+
+function showMenu() {
+  state = 'menu';
+  const today = new Date().toISOString().slice(0, 10);
+  document.getElementById('dailyBtn').textContent = 'Daily challenge (' + today + ')';
+  const inRoom = !!room;
+  document.getElementById('home').style.display = inRoom ? 'none' : 'flex';
+  document.getElementById('roomPanel').style.display = inRoom ? 'flex' : 'none';
+  document.getElementById('lb').style.display = inRoom ? 'none' : '';
+  if (inRoom) showRoomPanel(); else loadBoard();
+  try { document.getElementById('best').textContent = 'Your best today: ' + (+localStorage.getItem('best-daily-' + dailySeed()) || 0); } catch (e) {}
+  document.getElementById('menu').style.display = 'flex';
+}
+document.getElementById('dailyBtn').onclick = () => {
+  if (DB_URL && !keyOf(playerName())) {
+    document.getElementById('result').textContent = 'Type your name first';
+    nameBox.style.outline = '3px solid #ffd23f';
+    nameBox.focus(); return;
+  }
+  startGame('daily');
+};
+document.getElementById('freeBtn').onclick = () => startGame('free');
+
+// ---------- LEADERBOARD (Firebase Realtime Database, no server needed) ----------
+const nameBox = document.getElementById('name');
+try { nameBox.value = localStorage.getItem('player-name') || ''; } catch (e) {}
+nameBox.oninput = () => { try { localStorage.setItem('player-name', nameBox.value); } catch (e) {} };
+const playerName = () => nameBox.value.trim().slice(0, 12);
+const keyOf = n => n.toLowerCase().replace(/[^a-z0-9]/g, '');   // database keys can't have symbols
+
+async function checkDb() {       // tells you on the menu exactly what is wrong with the database
+  const el = document.getElementById('dbstatus');
+  if (!DB_URL) { el.textContent = 'Database: not set. Paste your link below and tap Save.'; return; }
+  if (!/^https:\/\/[a-z0-9.-]+\.(firebasedatabase\.app|firebaseio\.com)$/i.test(DB_URL)) {
+    el.textContent = 'Database: the link looks wrong. It should look like https://NAME-default-rtdb.firebasedatabase.app (not the console.firebase.google.com address).';
+    return;
+  }
+  el.textContent = 'Database: checking...';
+  try {
+    const r = await fetch(DB_URL + '/scores/ping.json');
+    if (r.ok) el.textContent = 'Database: connected \u2713';
+    else if (r.status === 401 || r.status === 403) el.textContent = 'Database: link is right, but the rules block access. Publish the rules from step 3 (HTTP ' + r.status + ').';
+    else if (r.status === 404) el.textContent = 'Database: link not found (HTTP 404). Copy the link again from the Data tab.';
+    else el.textContent = 'Database: error HTTP ' + r.status;
+  } catch (e) { el.textContent = 'Database: cannot connect. Check your internet and the link.'; }
+}
+document.getElementById('dburl').value = DB_URL;
+document.getElementById('dbsave').onclick = () => {
+  DB_URL = cleanUrl(document.getElementById('dburl').value);
+  document.getElementById('dburl').value = DB_URL;
+  try { localStorage.setItem('db-url', DB_URL); } catch (e) {}
+  checkDb(); loadBoard();
+};
+
+async function submitScore(s) {
+  const n = playerName(), k = keyOf(n);
+  if (!DB_URL || !k) return;
+  try {   // the database only accepts the score if it beats your earlier one that day
+    await fetch(DB_URL + '/scores/' + seed + '/' + k + '.json', {
+      method: 'PUT', body: JSON.stringify({ name: n, score: s, level: level })
+    });
+  } catch (e) {}
+  loadBoard();
+}
+
+async function loadBoard() {
+  const box = document.getElementById('lb');
+  if (!DB_URL) { box.textContent = 'Leaderboard is not set up yet.'; return; }
+  try {
+    const r = await fetch(DB_URL + '/scores/' + dailySeed() + '.json');
+    const data = await r.json();
+    const list = Object.values(data || {}).filter(p => p && typeof p.score === 'number')
+      .sort((a, b) => b.score - a.score).slice(0, 12);
+    box.textContent = '';
+    if (!list.length) { box.textContent = 'No scores yet today. Be the first!'; return; }
+    const title = document.createElement('b'); title.textContent = "Today's leaderboard"; box.appendChild(title);
+    list.forEach((p, i) => {
+      const row = document.createElement('div');
+      row.textContent = (i + 1) + '. ' + p.name + '  -  ' + p.score;
+      box.appendChild(row);
+    });
+  } catch (e) { box.textContent = 'Could not load the leaderboard.'; }
+}
+
+// ---------- LIVE RACE ROOMS (up to 12 players, same track for everyone) ----------
+let room = null, ghosts = {}, busy = false;
+const MAX_PLAYERS = 12;
+const api = p => DB_URL + '/rooms/' + p + '.json';
+const check = r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r; };   // Firebase said no (rules/URL problem)
+const dbGet = async p => (await check(await fetch(api(p)))).json();
+const dbPut = async (p, v) => check(await fetch(api(p), { method: 'PUT', body: JSON.stringify(v) }));
+const dbDel = async p => check(await fetch(api(p), { method: 'DELETE' }));
+const fbHelp = e => 'Firebase refused (' + (e && e.message || 'no connection') + '). Check: 1) the new rules are published, 2) DB_URL is your exact database link.';
+const say = t => { document.getElementById('result').textContent = t; };
+const r1 = v => Math.round(v * 10) / 10;
+
+function needName() {
+  if (!DB_URL) { say('Set up the database link first (step 2).'); return false; }
+  if (!keyOf(playerName())) { say('Type your name first'); nameBox.focus(); return false; }
+  return true;
+}
+
+function pushNow(alive) {       // send my position and score to the room
+  if (!room) return;
+  return dbPut(room.code + '/players/' + room.me, { name: room.name, s: score(), d: r1(distance), x: r1(px), y: r1(py), a: alive });
+}
+
+async function createRoom() {
+  if (!needName()) return;
+  const abc = 'ABCDEFGHJKLMNPQRSTUVWXYZ'; let code = '';
+  for (let i = 0; i < 4; i++) code += abc[Math.floor(Math.random() * abc.length)];
+  const me = keyOf(playerName());
+  try {
+    await dbPut(code + '/meta', { host: me, state: 'lobby', seed: 1, round: 0 });
+    await dbPut(code + '/players/' + me, { name: playerName(), s: 0, d: 0, x: 0, y: 0, a: false });
+  } catch (e) { say(fbHelp(e)); return; }
+  room = { code, me, name: playerName(), host: true, lastRound: 0, players: {}, meta: null };
+  say(''); showMenu();
+}
+
+async function joinRoom() {
+  if (!needName()) return;
+  const code = document.getElementById('code').value.trim().toUpperCase();
+  if (code.length !== 4) return say('Type the 4-letter room code');
+  const me = keyOf(playerName());
+  try {
+    const data = await dbGet(code);
+    if (!data || !data.meta) return say('Room not found');
+    const players = data.players || {};
+    if (players[me]) return say('That name is already used in this room');
+    if (Object.keys(players).length >= MAX_PLAYERS) return say('Room is full (12 players)');
+    await dbPut(code + '/players/' + me, { name: playerName(), s: 0, d: 0, x: 0, y: 0, a: false });
+    room = { code, me, name: playerName(), host: false, lastRound: data.meta.round, players, meta: data.meta };
+    say(''); showMenu();
+  } catch (e) { say(fbHelp(e)); }
+}
+
+async function leaveRoom() {
+  const r = room; room = null; ghosts = {};
+  try { if (r.host) await dbDel(r.code); else await dbDel(r.code + '/players/' + r.me); } catch (e) {}
+  say(''); showMenu();
+}
+
+async function hostStart() {     // the host starts a new round for everyone with a new shared seed
+  try {
+    await dbPut(room.code + '/meta', { host: room.me, state: 'racing', seed: Math.floor(Math.random() * 1e9), round: (room.meta ? room.meta.round : 0) + 1 });
+  } catch (e) { say('Could not start. Try again.'); }
+}
+
+function standings() {
+  if (!room) return [];
+  return Object.keys(room.players || {}).map(k => {
+    const p = room.players[k], me = k === room.me;
+    return { me, name: p.name, s: me && state === 'play' ? score() : p.s, a: me ? state === 'play' : p.a };
+  }).sort((a, b) => b.s - a.s);
+}
+
+function showRoomPanel() {
+  const r = room; if (!r) return;
+  const started = r.meta && r.meta.round > 0;
+  document.getElementById('roomInfo').textContent = 'Room ' + r.code + (started ? '  -  race ' + r.meta.round : (r.host ? '  -  share this code' : '  -  waiting for host'));
+  const list = document.getElementById('roomList'); list.textContent = '';
+  standings().forEach((p, i) => {
+    const row = document.createElement('div');
+    row.textContent = (started ? (i + 1) + '. ' : '') + p.name + (started ? '  -  ' + p.s : '') + (p.a ? '  (running)' : '');
+    list.appendChild(row);
+  });
+  const sb = document.getElementById('startBtn');
+  sb.style.display = r.host ? '' : 'none';
+  sb.textContent = started ? 'Race again' : 'Start race';
+}
+
+async function netTick() {       // runs every 0.6 seconds while you are in a room
+  if (!room || busy) return;
+  busy = true;
+  const r = room;
+  try {
+    if (state === 'play') await pushNow(true);
+    const data = await dbGet(r.code);
+    if (room !== r) { busy = false; return; }
+    if (!data || !data.meta) { room = null; ghosts = {}; say('The host closed the room.'); showMenu(); busy = false; return; }
+    const now = performance.now();
+    r.players = data.players || {}; r.meta = data.meta;
+    for (const k in r.players) {
+      if (k === r.me) continue;
+      const p = r.players[k], g = ghosts[k];
+      if (g && p.d === g.d) { Object.assign(g, { x: p.x, y: p.y, a: p.a, s: p.s, name: p.name }); continue; }
+      let v = g ? g.v : START_SPEED;
+      if (g && p.d > g.d) v = (p.d - g.d) / ((now - g.t) / 1000);
+      ghosts[k] = { ...p, t: now, v: Math.min(v, MAX_SPEED + 4) };
+    }
+    for (const k in ghosts) if (!r.players[k]) delete ghosts[k];
+    if (r.meta.state === 'racing' && r.meta.round !== r.lastRound && state !== 'play') {
+      r.lastRound = r.meta.round; startGame('race', r.meta.seed);
+    } else if (state === 'menu') showRoomPanel();
+  } catch (e) { if (state === 'menu') say(fbHelp(e)); }
+  busy = false;
+}
+setInterval(netTick, 600);
+
+function drawGhosts(now) {       // other players, drawn semi-transparent ahead of or behind you
+  for (const k in ghosts) {
+    const g = ghosts[k]; if (!g.a) continue;
+    const rel = g.d + Math.min(1.2, (now - g.t) / 1000) * g.v - distance;
+    if (rel < -5 || rel > 60) continue;
+    const t = tOf(rel), x = xOf(g.x || 0, t), u = U * t, gy = yOf(t) - (g.y || 0) * u, bw = SPREAD * 0.4 * t;
+    ctx.globalAlpha = 0.55;
+    ctx.fillStyle = '#ff6b81'; ctx.fillRect(x - bw / 2, gy - 1.8 * u, bw, 1.44 * u);
+    ctx.fillStyle = '#ffe0bd'; ctx.beginPath(); ctx.arc(x, gy - 1.71 * u, bw * 0.38, 0, 7); ctx.fill();
+    ctx.globalAlpha = 1; ctx.fillStyle = '#fff';
+    ctx.font = '600 ' + Math.max(10, 13 * t) + 'px system-ui'; ctx.textAlign = 'center';
+    ctx.fillText(g.name, x, gy - 2.1 * u); ctx.textAlign = 'left';
+  }
+}
+
+function drawStandings() {       // live ranking at the top right
+  ctx.textAlign = 'right'; ctx.font = '600 13px system-ui';
+  standings().slice(0, 12).forEach((p, i) => {
+    ctx.globalAlpha = p.a || p.me ? 1 : 0.5;
+    ctx.fillStyle = p.me ? '#ffd23f' : '#fff';
+    ctx.fillText((i + 1) + '. ' + p.name + ' ' + p.s, W - 10, 26 + i * 17);
+  });
+  ctx.globalAlpha = 1; ctx.textAlign = 'left';
+}
+
+document.getElementById('raceBtn').onclick = createRoom;
+document.getElementById('joinBtn').onclick = joinRoom;
+document.getElementById('startBtn').onclick = hostStart;
+document.getElementById('leaveBtn').onclick = leaveRoom;
+
+// ---------- CONTROLS ----------
+const moveLane = d => { lane = Math.max(0, Math.min(2, lane + d)); };
+const jump  = () => { if (py === 0) { vy = 11; slideT = 0; } };
+const slide = () => { if (py > 0) vy = -18; slideT = 0.6; };
+let sx = 0, sy = 0;
+addEventListener('touchstart', e => { sx = e.touches[0].clientX; sy = e.touches[0].clientY; }, { passive: true });
+addEventListener('touchend', e => {
+  if (state !== 'play') return;
+  const dx = e.changedTouches[0].clientX - sx, dy = e.changedTouches[0].clientY - sy;
+  if (Math.abs(dx) < 30 && Math.abs(dy) < 30) return;
+  if (Math.abs(dx) > Math.abs(dy)) moveLane(dx > 0 ? 1 : -1);
+  else if (dy < 0) jump(); else slide();
+}, { passive: true });
+addEventListener('keydown', e => {      // keyboard for testing on a computer
+  if (state !== 'play') return;
+  if (e.key === 'ArrowLeft') moveLane(-1);
+  if (e.key === 'ArrowRight') moveLane(1);
+  if (e.key === 'ArrowUp') jump();
+  if (e.key === 'ArrowDown') slide();
+});
+
+// ---------- UPDATE ----------
+function update(dt) {
+  const newLevel = Math.floor(score() / SCORE_PER_LEVEL) + 1;
+  if (newLevel > level) { level = newLevel; flashT = 1.2; }          // "Speed up!" message
+  const target = Math.min(START_SPEED + (level - 1) * SPEED_STEP, MAX_SPEED);
+  speed += (target - speed) * Math.min(1, dt * 1.5);                 // eases up smoothly, no sudden jump
+  if (flashT > 0) flashT -= dt;
+  distance += speed * dt;
+  px += (LANEX[lane] - px) * Math.min(1, dt * 14);
+  if (py > 0 || vy > 0) { vy -= 32 * dt; py += vy * dt; if (py <= 0) { py = 0; vy = 0; } }
+  if (slideT > 0) slideT -= dt;
+  const h = slideT > 0 ? 0.7 : 1.8;
+
+  const i0 = Math.max(3, Math.ceil((distance - 4) / ROW_SPACING)), i1 = Math.floor((distance + 4) / ROW_SPACING);
+  for (let i = i0; i <= i1; i++) {
+    const d = i * ROW_SPACING - distance;
+    for (const it of getRow(i)) {
+      if (it.done || Math.abs(d + it.z) > 0.9) continue;
+      if (Math.abs(px - LANEX[it.lane]) > 0.4) continue;
+      if (py < it.top && py + h > it.bot) {
+        if (it.type === 'coin') { it.done = true; coins++; }
+        else { die(); return; }
+      }
+    }
+  }
+}
+
+// ---------- DRAW ----------
+function drawTrack() {
+  const sky = ctx.createLinearGradient(0, 0, 0, HZ);
+  sky.addColorStop(0, '#1b1740'); sky.addColorStop(1, '#ff7a59');
+  ctx.fillStyle = sky; ctx.fillRect(0, 0, W, HZ + 1);
+  // simple city skyline
+  ctx.fillStyle = '#2a1f4d';
+  const rb = makeRng(7);
+  for (let x = 0; x < W; x += 28) { const bh = 14 + rb() * 50; ctx.fillRect(x, HZ - bh, 26, bh + 1); }
+  ctx.fillStyle = '#241a4a'; ctx.fillRect(0, HZ, W, H - HZ);
+  // striped track so you can feel the speed
+  const g0 = Math.floor(distance / 6);
+  for (let j = 0; j < 16; j++) {
+    const g = g0 + j - 1, d0 = g * 6 - distance, d1 = d0 + 6;
+    if (d0 < -6) continue;
+    const t0 = tOf(d0), t1 = tOf(d1);
+    ctx.fillStyle = g % 2 ? '#3a2b6e' : '#33265f';
+    ctx.beginPath();
+    ctx.moveTo(xOf(-1.5, t0), yOf(t0)); ctx.lineTo(xOf(1.5, t0), yOf(t0));
+    ctx.lineTo(xOf(1.5, t1), yOf(t1)); ctx.lineTo(xOf(-1.5, t1), yOf(t1));
+    ctx.fill();
+  }
+  // lane lines
+  for (const b of [-1.5, -0.5, 0.5, 1.5]) {
+    ctx.strokeStyle = Math.abs(b) > 1 ? '#2ee6c5' : '#8f7fd1';
+    ctx.lineWidth = Math.abs(b) > 1 ? 3 : 2;
+    ctx.beginPath(); ctx.moveTo(xOf(b, 0), HZ); ctx.lineTo(xOf(b, TB), H); ctx.stroke();
+  }
+}
+
+function drawItem(it, d, now) {
+  const t = tOf(d), x = xOf(LANEX[it.lane], t), gy = yOf(t);
+  const w = SPREAD * 0.8 * t, u = U * t;
+  ctx.globalAlpha = Math.max(0, Math.min(1, (62 - d) / 20));
+  if (it.type === 'coin') {
+    const sp = Math.abs(Math.cos(now / 160));
+    ctx.fillStyle = '#ffd23f';
+    ctx.beginPath(); ctx.ellipse(x, gy - 1.0 * u, Math.max(1, 0.3 * u * sp), 0.3 * u, 0, 0, 7); ctx.fill();
+  } else if (it.type === 'low') {
+    ctx.fillStyle = '#ff9f43'; ctx.fillRect(x - w / 2, gy - 0.8 * u, w, 0.8 * u);
+    ctx.fillStyle = '#fff3'; ctx.fillRect(x - w / 2, gy - 0.5 * u, w, 0.12 * u);
+  } else if (it.type === 'high') {
+    ctx.fillStyle = '#b33939';
+    ctx.fillRect(x - w / 2, gy - 1.6 * u, w * 0.1, 1.6 * u); ctx.fillRect(x + w / 2 - w * 0.1, gy - 1.6 * u, w * 0.1, 1.6 * u);
+    ctx.fillStyle = '#ee5253'; ctx.fillRect(x - w / 2, gy - 2.2 * u, w, 0.6 * u);
+  } else {
+    ctx.fillStyle = '#576574'; ctx.fillRect(x - w / 2, gy - 2.4 * u, w, 2.4 * u);
+    ctx.fillStyle = '#ffd96a';
+    for (let r = 0; r < 3; r++) for (let c = 0; c < 2; c++) ctx.fillRect(x - w * 0.3 + c * w * 0.35, gy - 2.1 * u + r * 0.7 * u, w * 0.2, 0.3 * u);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawPlayer() {
+  const h = slideT > 0 ? 0.7 : 1.8, x = xOf(px, 1), gy = PY - py * U;
+  ctx.fillStyle = '#0005';   // shadow
+  ctx.beginPath(); ctx.ellipse(xOf(px, 1), PY, SPREAD * 0.22 * (1 - py * 0.15), SPREAD * 0.07, 0, 0, 7); ctx.fill();
+  const bw = SPREAD * 0.4;
+  ctx.fillStyle = state === 'dead' ? '#ff6b6b' : '#2ee6c5';
+  ctx.fillRect(x - bw / 2, gy - h * U, bw, h * U * 0.8);
+  ctx.fillStyle = '#ffe0bd';
+  ctx.beginPath(); ctx.arc(x, gy - h * U * 0.95, bw * (slideT > 0 ? 0.3 : 0.38), 0, 7); ctx.fill();
+}
+
+function render(now) {
+  drawTrack();
+  const list = [];
+  const iStart = Math.max(3, Math.floor((distance - 8) / ROW_SPACING));
+  for (let i = iStart; i * ROW_SPACING - distance < 64; i++) {
+    for (const it of getRow(i)) {
+      const d = i * ROW_SPACING - distance + it.z;
+      if (d > -6 && d < 64 && !it.done) list.push([it, d]);
+    }
+  }
+  list.sort((a, b) => b[1] - a[1]);
+  for (const [it, d] of list) if (d > 0) drawItem(it, d, now);     // far items first
+  if (room) drawGhosts(now);
+  drawPlayer();
+  for (const [it, d] of list) if (d <= 0) drawItem(it, d, now);    // items behind the player drawn on top
+  // score
+  ctx.fillStyle = '#fff'; ctx.font = '700 22px system-ui'; ctx.textAlign = 'left';
+  ctx.fillText('Score ' + score(), 14, 34);
+  ctx.fillStyle = '#ffd23f'; ctx.font = '600 16px system-ui';
+  ctx.fillText('Coins ' + coins, 14, 58);
+  ctx.fillStyle = '#fff'; ctx.fillText('Speed level ' + level, 14, 80);
+  if (flashT > 0 && state === 'play') {
+    ctx.globalAlpha = Math.min(1, flashT);
+    ctx.fillStyle = '#ffd23f'; ctx.font = '800 30px system-ui'; ctx.textAlign = 'center';
+    ctx.fillText('Speed up!', W / 2, H * 0.2);
+    ctx.textAlign = 'left'; ctx.globalAlpha = 1;
+  }
+  if (room) drawStandings();
+  if (state === 'dead') { ctx.fillStyle = '#ff000033'; ctx.fillRect(0, 0, W, H); }
+}
+
+// ---------- MAIN LOOP ----------
+let last = performance.now();
+function loop(now) {
+  const dt = Math.min((now - last) / 1000, 0.05); last = now;
+  if (state === 'play') update(dt);
+  render(now);
+  requestAnimationFrame(loop);
+}
+showMenu();
+checkDb();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
